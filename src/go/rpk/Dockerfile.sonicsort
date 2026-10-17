@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1
+#
+# Patched redpandadata/redpanda for SonicSort (poslogica/sonicsort), which
+# runs a single dev-container broker for its download pipeline.
+#
+# SonicSort's image scan found the public image's Critical/High CVEs all in
+# rpk: the Go stdlib of the toolchain it was built with, plus the x/net,
+# x/text and grpc modules (bumped in this branch's go.mod). Redpanda itself
+# (C++/Seastar) is unchanged -- this rebuilds only rpk, from this tag's
+# src/go/rpk, on a current Go toolchain, and drops it into the official
+# image of the same version.
+#
+# Flattened (final stage is FROM scratch + COPY of the whole filesystem):
+# replacing rpk in a new layer would leave the old binary in the base
+# image's lower layer, and scanners still report it from there. That means
+# the image metadata below (ENV/USER/ENTRYPOINT/CMD/EXPOSE/VOLUME) is
+# re-declared by hand -- keep it in step with `docker inspect` of
+# REDPANDA_IMAGE when bumping it.
+#
+#   docker build -f Dockerfile.sonicsort -t sonicsort-redpanda:local .   (from src/go/rpk)
+
+# Keep REDPANDA_IMAGE's version in step with this branch's tag.
+ARG REDPANDA_IMAGE=redpandadata/redpanda:v26.2.2
+ARG RPK_VERSION=v26.2.2
+
+FROM golang:1.27-alpine AS rpk
+ARG RPK_VERSION
+ARG COMMIT_ID=unknown
+ENV CGO_ENABLED=0 GOTOOLCHAIN=local
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+# Same -X stamps as build.sh.
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    ver_pkg=github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version && \
+    cont_pkg=github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/container/containerutil && \
+    go build -trimpath -o /out/rpk -ldflags "-s -w \
+      -X ${ver_pkg}.version=${RPK_VERSION} \
+      -X ${ver_pkg}.rev=$(echo ${COMMIT_ID} | cut -c1-12) \
+      -X ${cont_pkg}.tag=${RPK_VERSION} \
+      -X ${ver_pkg}.buildTime=$(date -Iseconds) \
+      -X ${ver_pkg}.hostOs=linux -X ${ver_pkg}.hostArch=amd64" \
+      ./cmd/rpk
+
+FROM ${REDPANDA_IMAGE} AS patched
+USER root
+# Weekly cache-buster: SonicSort's build scripts pass the current ISO week,
+# so the Debian upgrade below re-runs at least weekly.
+ARG OS_PATCH_WEEK=unset
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+COPY --from=rpk /out/rpk /opt/redpanda/libexec/rpk
+RUN /opt/redpanda/bin/rpk version
+
+FROM scratch
+COPY --from=patched / /
+
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    EDITOR=nano
+USER redpanda
+EXPOSE 8081 8082 9092 9644
+VOLUME ["/var/lib/redpanda/data"]
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["redpanda", "start", "--overprovisioned"]
