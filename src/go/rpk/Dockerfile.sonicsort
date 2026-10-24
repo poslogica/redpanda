@@ -19,9 +19,16 @@
 #
 #   docker build -f Dockerfile.sonicsort -t sonicsort-redpanda:local .   (from src/go/rpk)
 
-# Keep REDPANDA_IMAGE's version in step with this branch's tag.
-ARG REDPANDA_IMAGE=redpandadata/redpanda:v26.2.2
+# Keep the redpandadata/redpanda FROM below in step with this branch's tag.
+# It is written out, not an ARG: basewarden builds this with --pull off (it
+# needs the local DEBIAN_BASE) and pulls the public images it finds in FROM
+# lines itself, which skips ${ARG} references.
 ARG RPK_VERSION=v26.2.2
+# basewarden's Debian base, for its patched zlib1g (CVE-2026-85091; see
+# poslogica/debuerreotype sonicsort/Dockerfile). basewarden passes it.
+ARG DEBIAN_BASE=basewarden-debian:local
+
+FROM ${DEBIAN_BASE} AS debian
 
 FROM golang:1.27-alpine AS rpk
 ARG RPK_VERSION
@@ -43,12 +50,25 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
       -X ${ver_pkg}.hostOs=linux -X ${ver_pkg}.hostArch=amd64" \
       ./cmd/rpk
 
-FROM ${REDPANDA_IMAGE} AS patched
+FROM redpandadata/redpanda:v26.2.2 AS patched
 USER root
 # Weekly cache-buster: SonicSort's build scripts pass the current ISO week,
 # so the Debian upgrade below re-runs at least weekly.
 ARG OS_PATCH_WEEK=unset
 RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+# The official image is trixie, like our base: take our patched zlib1g while
+# it is newer than the image's own (the base leaves the directory empty once
+# Debian's fix has replaced ours).
+COPY --from=debian /var/lib/basewarden/apt/ /tmp/basewarden-apt/
+RUN set -eu; \
+    for deb in /tmp/basewarden-apt/zlib1g_*.deb; do \
+      [ -e "$deb" ] || continue; \
+      ours="$(dpkg-deb -f "$deb" Version)"; \
+      have="$(dpkg-query -W -f '${Version}' zlib1g)"; \
+      if dpkg --compare-versions "$ours" gt "$have"; then dpkg -i "$deb"; fi; \
+    done; \
+    rm -rf /tmp/basewarden-apt; \
+    dpkg-query -W zlib1g
 COPY --from=rpk /out/rpk /opt/redpanda/libexec/rpk
 RUN /opt/redpanda/bin/rpk version
 
